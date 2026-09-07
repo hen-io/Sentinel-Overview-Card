@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-# K93 Advanced Notification System overview lovelace card
+# K93 Advanced Notification System - Overview lovelace card
 
 A Home Assistant Lovelace card showing notification history and outstanding unacknowledged
 notifications from the **k93-ans** integration, with an optional full-width scrolling ticker.
