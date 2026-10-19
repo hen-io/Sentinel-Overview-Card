@@ -1,6 +1,6 @@
 {
-  "name": "K93 ANS Overview Card",
-  "filename": "k93-ans-overview-card.js",
+  "name": "Sentinel Overview Card",
+  "filename": "sentinel-overview-card.js",
   "render_readme": true,
   "homeassistant": "2026.6.0"
 }

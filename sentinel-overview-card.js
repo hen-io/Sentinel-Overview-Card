@@ -1,4 +1,7 @@
 
+const CARD_VERSION = "0.2.0";
+const CARD_TAG = "sentinel-overview-card";
+const LEGACY_CARD_TAG = "k93-ans-overview-card";
 const IMPORTANCE_LEVELS = ["low", "normal", "high", "critical"];
 
 function fireDomEvent(node, type, detail) {
@@ -49,7 +52,7 @@ function handleTapAction(node, hass, actionConfig) {
   }
 }
 
-const BUILTIN_CHANNEL_KEYS = ["info", "alert", "event", "reminder", "security", "system"];
+const BUILTIN_CHANNEL_KEYS = ["info", "alert", "event", "reminder", "security", "system", "chat"];
 
 const LOCALE_TAG = { en: "en", no: "nb-NO" };
 
@@ -61,6 +64,7 @@ const STRINGS = {
     acknowledge: "Acknowledge",
     delete: "Delete",
     clear_history: "Clear",
+    filter: "Filter",
     confirm_clear_history: "Clear all history? This can't be undone.",
     today: "Today",
     yesterday: "Yesterday",
@@ -73,6 +77,7 @@ const STRINGS = {
     acknowledge: "Bekreft",
     delete: "Slett",
     clear_history: "Tøm",
+    filter: "Filtrer",
     confirm_clear_history: "Tøm all historikk? Dette kan ikke angres.",
     today: "I dag",
     yesterday: "I går",
@@ -92,39 +97,136 @@ function importanceRank(level) {
 }
 
 const CHANNEL_IMPORTANCE_PREFIX = "history_channel_importance__";
+const CHANNEL_LABELS_PREFIX = "history_channel_labels__";
 
-function perChannelImportanceFromConfig(cfg) {
+function prefixedConfigMap(cfg, prefix) {
   const map = {};
-  for (const key of Object.keys(cfg || {})) {
-    if (key.startsWith(CHANNEL_IMPORTANCE_PREFIX) && cfg[key]) {
-      map[key.slice(CHANNEL_IMPORTANCE_PREFIX.length)] = cfg[key];
+  for (const [key, value] of Object.entries(cfg || {})) {
+    if (key.startsWith(prefix) && value && (!Array.isArray(value) || value.length)) {
+      map[key.slice(prefix.length).toLowerCase()] = value;
     }
   }
   return map;
 }
 
-function matchesFilter(record, channels, minImportance, channelMode, perChannelImportance) {
-  if (record.show_in_history === false) return false;
-  const hasList = Boolean(channels && channels.length);
-  const recordChannels = (Array.isArray(record.channels) && record.channels.length
-    ? record.channels
-    : [record.channel]
-  ).map((c) => String(c || "").toLowerCase());
-  const inList = hasList && channels.some((c) => recordChannels.includes(String(c).toLowerCase()));
-  const channelOk = channelMode === "exclude" ? !inList : !hasList || inList;
-  if (!channelOk) return false;
+function lower(value) {
+  return String(value ?? "").toLowerCase();
+}
 
-  const recordRank = importanceRank(record.importance);
-  if (channelMode !== "exclude" && hasList && perChannelImportance) {
-    const selectedLower = channels.map((c) => String(c).toLowerCase());
-    const matchingChannels = recordChannels.filter((c) => selectedLower.includes(c));
-    return matchingChannels.some((c) => {
-      const threshold = perChannelImportance[c] || minImportance || "low";
-      return recordRank >= importanceRank(threshold);
-    });
+function recordChannelKeys(record) {
+  const channels = Array.isArray(record.channels) && record.channels.length ? record.channels : [record.channel];
+  return channels.map(lower);
+}
+
+function recordLabelKeys(record) {
+  return (Array.isArray(record.labels) ? record.labels : []).map(lower);
+}
+
+function matchesFilter(record, filter) {
+  if (record.show_in_history === false) return false;
+  const selected = (filter.channels || []).map(lower);
+  const recordChannels = recordChannelKeys(record);
+  const inList = selected.some((c) => recordChannels.includes(c));
+  if (filter.mode === "exclude" ? inList : selected.length && !inList) return false;
+
+  const rank = importanceRank(record.importance);
+  if (filter.mode !== "exclude" && selected.length) {
+    const labels = recordLabelKeys(record);
+    return recordChannels
+      .filter((c) => selected.includes(c))
+      .some((c) => {
+        const threshold = filter.channelImportance?.[c] || filter.minImportance || "low";
+        const wanted = (filter.channelLabels?.[c] || []).map(lower);
+        return rank >= importanceRank(threshold) && (!wanted.length || wanted.some((l) => labels.includes(l)));
+      });
+  }
+  return rank >= importanceRank(filter.minImportance || "low");
+}
+
+const WS_PREFIXES = ["sentinel", "k93_ans"];
+let wsPrefix = null;
+
+class SentinelApi {
+  constructor() {
+    this.hass = null;
   }
 
-  return recordRank >= importanceRank(minImportance || "low");
+  get legacy() {
+    return wsPrefix !== null && wsPrefix !== WS_PREFIXES[0];
+  }
+
+  async _withPrefix(fn) {
+    if (wsPrefix) return fn(wsPrefix);
+    let lastError;
+    for (const prefix of WS_PREFIXES) {
+      try {
+        const result = await fn(prefix);
+        wsPrefix = prefix;
+        return result;
+      } catch (err) {
+        if (err?.code !== "unknown_command") throw err;
+        lastError = err;
+      }
+    }
+    throw lastError;
+  }
+
+  call(name, params = {}) {
+    return this._withPrefix((prefix) => this.hass.callWS({ ...params, type: `${prefix}/${name}` }));
+  }
+
+  subscribe(name, onEvent, params = {}) {
+    return this._withPrefix((prefix) =>
+      this.hass.connection.subscribeMessage(onEvent, { ...params, type: `${prefix}/${name}` })
+    );
+  }
+
+  async config() {
+    if (!this.legacy) {
+      try {
+        return await this.call("config");
+      } catch (err) {
+        if (err?.code !== "unknown_command") throw err;
+      }
+    }
+    const sensor = Object.values(this.hass.states).find((s) => Array.isArray(s.attributes?.channels));
+    return { channels: sensor ? sensor.attributes.channels : [] };
+  }
+}
+
+function channelDefs(config) {
+  return Array.isArray(config?.channels) ? config.channels : [];
+}
+
+function channelColor(config, record) {
+  const key = lower(record.channel);
+  return channelDefs(config).find((c) => lower(c.key) === key)?.color || "";
+}
+
+function labelName(config, key) {
+  for (const channel of channelDefs(config)) {
+    const label = (channel.labels || []).find((l) => lower(l.key) === lower(key));
+    if (label) return label.name;
+  }
+  return key;
+}
+
+function channelOptions(config) {
+  const channels = channelDefs(config);
+  if (!channels.length) return BUILTIN_CHANNEL_KEYS.map((key) => ({ value: key, label: key }));
+  return channels.map((c) => ({
+    value: c.key,
+    label: c.enabled === false ? `${c.name} (${c.key}, disabled)` : `${c.name} (${c.key})`,
+  }));
+}
+
+function labelOptions(config, channelKey) {
+  const channel = channelDefs(config).find((c) => lower(c.key) === lower(channelKey));
+  return (channel?.labels || []).map((l) => ({ value: l.key, label: l.name }));
+}
+
+function defineElement(tag, ctor) {
+  if (!customElements.get(tag)) customElements.define(tag, ctor);
 }
 
 function formatRelativeTime(iso, locale, lang) {
@@ -146,37 +248,60 @@ function formatRelativeTime(iso, locale, lang) {
   return `${date.toLocaleDateString(locale)} ${time}`;
 }
 
-class K93AnsOverviewCard extends HTMLElement {
+class SentinelOverviewCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
+    this._api = new SentinelApi();
     this._notifications = [];
+    this._sentinelConfig = null;
+    this._viewFilter = { channel: null, labels: [] };
     this._subscribed = false;
     this._unsubscribe = null;
     this._lightboxSrc = null;
+    this._onReconnect = () => this._fetchList();
 
     this.shadowRoot.addEventListener("click", (event) => {
-      const ackButton = event.target.closest("[data-ack-id]");
+      const target = event.target;
+      const ackButton = target.closest("[data-ack-id]");
       if (ackButton) {
         this._acknowledge(ackButton.dataset.ackId);
         return;
       }
-      const deleteButton = event.target.closest("[data-delete-id]");
+      const deleteButton = target.closest("[data-delete-id]");
       if (deleteButton) {
         this._delete(deleteButton.dataset.deleteId);
         return;
       }
-      if (event.target.closest("[data-clear-history]")) {
+      if (target.closest("[data-clear-history]")) {
         this._clearHistory();
         return;
       }
-      const lightboxTrigger = event.target.closest("[data-lightbox-src]");
+      const channelChip = target.closest("[data-filter-channel]");
+      if (channelChip) {
+        const key = channelChip.dataset.filterChannel || null;
+        this._viewFilter = { channel: this._viewFilter.channel === key ? null : key, labels: [] };
+        this._render();
+        return;
+      }
+      const labelChip = target.closest("[data-filter-label]");
+      if (labelChip) {
+        const key = labelChip.dataset.filterLabel;
+        const labels = this._viewFilter.labels;
+        this._viewFilter = {
+          ...this._viewFilter,
+          labels: labels.includes(key) ? labels.filter((l) => l !== key) : [...labels, key],
+        };
+        this._render();
+        return;
+      }
+      const lightboxTrigger = target.closest("[data-lightbox-src]");
       if (lightboxTrigger) {
         this._lightboxSrc = lightboxTrigger.dataset.lightboxSrc;
         this._render();
         return;
       }
-      if (event.target.closest("[data-lightbox-close]")) {
+      if (target.closest("[data-lightbox-close]")) {
         this._lightboxSrc = null;
         this._render();
       }
@@ -195,9 +320,11 @@ class K93AnsOverviewCard extends HTMLElement {
       show_unacknowledged: true,
       show_history: true,
       show_channel: true,
+      show_labels: true,
       show_importance: true,
       show_clear_history: true,
       show_delete_button: true,
+      show_filter_bar: false,
       image_display_mode: "thumbnail",
       history_channels: [],
       history_channels_mode: "include",
@@ -220,8 +347,10 @@ class K93AnsOverviewCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    this._api.hass = hass;
     if (!this._subscribed) {
       this._subscribed = true;
+      hass.connection.addEventListener("ready", this._onReconnect);
       this._subscribe();
       this._fetchList();
       this._render();
@@ -260,24 +389,37 @@ class K93AnsOverviewCard extends HTMLElement {
   }
 
   disconnectedCallback() {
+    this._hass?.connection.removeEventListener("ready", this._onReconnect);
     if (this._unsubscribe) {
       this._unsubscribe();
       this._unsubscribe = null;
-      this._subscribed = false;
     }
+    this._subscribed = false;
+  }
+
+  _historyFilter() {
+    const cfg = this._config;
+    return {
+      channels: cfg.history_channels,
+      mode: cfg.history_channels_mode,
+      minImportance: cfg.history_min_importance,
+      channelImportance: prefixedConfigMap(cfg, CHANNEL_IMPORTANCE_PREFIX),
+      channelLabels: prefixedConfigMap(cfg, CHANNEL_LABELS_PREFIX),
+    };
   }
 
   async _subscribe() {
     try {
-      this._unsubscribe = await this._hass.connection.subscribeMessage(
-        (msg) => {
-          if (msg.notification) this._onUpdate(msg.notification);
-          if (msg.deleted_ids) this._onDelete(msg.deleted_ids);
-        },
-        { type: "k93_ans/subscribe" }
-      );
+      this._unsubscribe = await this._api.subscribe("subscribe", (msg) => {
+        if (msg.notification) this._onUpdate(msg.notification);
+        if (msg.deleted_ids) this._onDelete(msg.deleted_ids);
+        if (msg.config) {
+          this._sentinelConfig = msg.config;
+          this._render();
+        }
+      });
     } catch (err) {
-      console.error("k93-ans-overview-card: failed to subscribe", err);
+      console.error(`${CARD_TAG}: failed to subscribe`, err);
     }
   }
 
@@ -285,32 +427,30 @@ class K93AnsOverviewCard extends HTMLElement {
     try {
       const cfg = this._config || {};
       const limit = cfg.max_items ?? 50;
-      const fetches = [
-        this._hass.callWS({ type: "k93_ans/list", include_acknowledged: true, limit }),
-      ];
+      const results = [await this._api.call("list", { include_acknowledged: true, limit })];
+      const more = [this._api.config()];
       if (cfg.history_channels && cfg.history_channels.length) {
-        fetches.push(
-          this._hass.callWS({
-            type: "k93_ans/list",
+        more.push(
+          this._api.call("list", {
             include_acknowledged: true,
             limit,
             channels: cfg.history_channels,
             channel_mode: cfg.history_channels_mode || "include",
-            min_importance: cfg.history_min_importance,
+            min_importance: cfg.history_min_importance || undefined,
           })
         );
       }
-      const results = await Promise.all(fetches);
+      if (!this._api.legacy) more.push(this._api.call("list", { outstanding_only: true }));
+      const [config, ...lists] = await Promise.all(more);
+      this._sentinelConfig = config;
       const byId = new Map();
-      for (const result of results) {
+      for (const result of [...results, ...lists]) {
         for (const record of result.notifications) byId.set(record.id, record);
       }
-      this._notifications = [...byId.values()].sort(
-        (a, b) => new Date(b.created) - new Date(a.created)
-      );
+      this._notifications = [...byId.values()].sort((a, b) => (a.created < b.created ? 1 : -1));
       this._render();
     } catch (err) {
-      console.error("k93-ans-overview-card: failed to load notifications", err);
+      console.error(`${CARD_TAG}: failed to load notifications`, err);
     }
   }
 
@@ -336,48 +476,70 @@ class K93AnsOverviewCard extends HTMLElement {
 
   async _acknowledge(notificationId) {
     try {
-      await this._hass.callWS({ type: "k93_ans/acknowledge", notification_id: notificationId });
+      await this._api.call("acknowledge", { notification_id: notificationId });
     } catch (err) {
-      console.error("k93-ans-overview-card: failed to acknowledge", err);
+      console.error(`${CARD_TAG}: failed to acknowledge`, err);
     }
   }
 
   async _delete(notificationId) {
     try {
-      await this._hass.callWS({ type: "k93_ans/delete", notification_ids: [notificationId] });
+      await this._api.call("delete", { notification_ids: [notificationId] });
     } catch (err) {
-      console.error("k93-ans-overview-card: failed to delete", err);
+      console.error(`${CARD_TAG}: failed to delete`, err);
     }
   }
 
   async _clearHistory() {
     if (!window.confirm(this._t("confirm_clear_history"))) return;
     try {
-      await this._hass.callWS({ type: "k93_ans/clear_history", include_unacknowledged: false });
+      await this._api.call("clear_history", { include_unacknowledged: false });
     } catch (err) {
-      console.error("k93-ans-overview-card: failed to clear history", err);
+      console.error(`${CARD_TAG}: failed to clear history`, err);
     }
   }
 
-  _channelColor(record) {
-    const hass = this._hass;
-    if (!hass) return "";
-    const cached = this._channelSensorId && hass.states[this._channelSensorId];
-    const channels = cached
-      ? cached.attributes.channels
-      : (() => {
-          for (const stateObj of Object.values(hass.states)) {
-            if (stateObj.entity_id.startsWith("sensor.k93_ans") && Array.isArray(stateObj.attributes?.channels)) {
-              this._channelSensorId = stateObj.entity_id;
-              return stateObj.attributes.channels;
-            }
-          }
-          return null;
-        })();
-    if (!Array.isArray(channels)) return "";
-    const recordChannel = String(record.channel || "").toLowerCase();
-    const match = channels.find((c) => String(c.key).toLowerCase() === recordChannel);
-    return (match && match.color) || "";
+  _channelName(key) {
+    return channelDefs(this._sentinelConfig).find((c) => lower(c.key) === lower(key))?.name || key;
+  }
+
+  _applyViewFilter(records) {
+    const { channel, labels } = this._viewFilter;
+    if (!channel) return records;
+    return records.filter(
+      (r) =>
+        recordChannelKeys(r).includes(channel) &&
+        (!labels.length || labels.some((l) => recordLabelKeys(r).includes(l)))
+    );
+  }
+
+  _chipHtml(attr, value, label, selected) {
+    const check = selected ? `<ha-icon class="chip-icon" icon="mdi:check"></ha-icon>` : "";
+    return (
+      `<button type="button" class="chip${selected ? " selected" : ""}" ${attr}="${esc(value)}" ` +
+      `aria-pressed="${selected}">${check}<span>${esc(label)}</span></button>`
+    );
+  }
+
+  _renderFilterBar(history) {
+    if (!this._config.show_filter_bar || !history.length) return "";
+    const { channel, labels } = this._viewFilter;
+    const presentChannels = [...new Set(history.flatMap(recordChannelKeys))];
+    const channelChips = presentChannels
+      .map((key) => this._chipHtml("data-filter-channel", key, this._channelName(key), channel === key))
+      .join("");
+    let labelChips = "";
+    if (channel) {
+      const configured = labelOptions(this._sentinelConfig, channel).map((o) => lower(o.value));
+      const present = history.filter((r) => recordChannelKeys(r).includes(channel)).flatMap(recordLabelKeys);
+      labelChips = [...new Set([...configured, ...present])]
+        .map((key) => this._chipHtml("data-filter-label", key, labelName(this._sentinelConfig, key), labels.includes(key)))
+        .join("");
+    }
+    return (
+      `<div class="filter-bar" role="toolbar" aria-label="${esc(this._t("filter"))}">${channelChips}</div>` +
+      (labelChips ? `<div class="filter-bar labels">${labelChips}</div>` : "")
+    );
   }
 
   _renderItem(record, locale) {
@@ -386,9 +548,9 @@ class K93AnsOverviewCard extends HTMLElement {
     const showFullImage = Boolean(record.image) && imageMode === "full";
 
     const icon = record.icon || "mdi:bell-outline";
-    const channelColor = this._channelColor(record);
+    const color = channelColor(this._sentinelConfig, record);
     const iconHtml = icon.startsWith("mdi:")
-      ? `<ha-icon icon="${esc(icon)}"${channelColor ? ` style="color: ${esc(channelColor)};"` : ""}></ha-icon>`
+      ? `<ha-icon icon="${esc(icon)}"${color ? ` style="color: ${esc(color)};"` : ""}></ha-icon>`
       : `<img class="thumb" src="${esc(icon)}" alt="" />`;
 
     let leftHtml;
@@ -427,6 +589,9 @@ class K93AnsOverviewCard extends HTMLElement {
         ? record.channels.join(", ")
         : record.channel;
       metaParts.push(esc(channelLabel));
+    }
+    if (this._config.show_labels && recordLabelKeys(record).length) {
+      metaParts.push(esc(recordLabelKeys(record).map((key) => labelName(this._sentinelConfig, key)).join(", ")));
     }
     metaParts.push(esc(formatRelativeTime(record.created, locale, this._lang())));
 
@@ -471,9 +636,9 @@ class K93AnsOverviewCard extends HTMLElement {
 
   _tickerItemHtml(record, locale, lang) {
     const icon = record.icon || "mdi:bell-outline";
-    const channelColor = this._channelColor(record);
+    const color = channelColor(this._sentinelConfig, record);
     const iconHtml = icon.startsWith("mdi:")
-      ? `<ha-icon class="ticker-icon" icon="${esc(icon)}"${channelColor ? ` style="color: ${esc(channelColor)};"` : ""}></ha-icon>`
+      ? `<ha-icon class="ticker-icon" icon="${esc(icon)}"${color ? ` style="color: ${esc(color)};"` : ""}></ha-icon>`
       : `<img class="ticker-icon-img" src="${esc(icon)}" alt="" />`;
     return (
       `<span class="ticker-item">${iconHtml}` +
@@ -485,9 +650,9 @@ class K93AnsOverviewCard extends HTMLElement {
     const cfg = this._config;
     if (!cfg.show_ticker) return "";
 
-    const perChannelImportance = perChannelImportanceFromConfig(cfg);
+    const filter = this._historyFilter();
     const items = (this._notifications || [])
-      .filter((n) => matchesFilter(n, cfg.history_channels, cfg.history_min_importance, cfg.history_channels_mode, perChannelImportance))
+      .filter((n) => matchesFilter(n, filter))
       .slice(0, cfg.ticker_limit ?? 10);
 
     if (!items.length) return "";
@@ -523,7 +688,8 @@ class K93AnsOverviewCard extends HTMLElement {
     const unacknowledged = all.filter(
       (n) => n.requires_ack && !n.acknowledged && n.show_in_history !== false
     );
-    const history = all.filter((n) => matchesFilter(n, cfg.history_channels, cfg.history_min_importance, cfg.history_channels_mode, perChannelImportanceFromConfig(cfg)));
+    const filter = this._historyFilter();
+    const history = all.filter((n) => matchesFilter(n, filter));
 
     const sections = [];
     if (cfg.show_unacknowledged) {
@@ -534,7 +700,7 @@ class K93AnsOverviewCard extends HTMLElement {
       });
     }
     if (cfg.show_history) {
-      sections.push({ key: "history", label: this._t("history"), items: history });
+      sections.push({ key: "history", label: this._t("history"), items: this._applyViewFilter(history) });
     }
 
     const body = sections
@@ -548,6 +714,7 @@ class K93AnsOverviewCard extends HTMLElement {
               <div class="section-title">${esc(section.label)}</div>
               ${clearButton}
             </div>
+            ${section.key === "history" ? this._renderFilterBar(history) : ""}
             ${
               section.items.length
                 ? section.items.map((item) => this._renderItem(item, locale)).join("")
@@ -623,7 +790,7 @@ class K93AnsOverviewCard extends HTMLElement {
         .ticker-track {
           display: inline-block;
           white-space: nowrap;
-          animation-name: k93-ticker;
+          animation-name: sentinel-ticker;
           animation-timing-function: linear;
           animation-iteration-count: infinite;
           color: var(--primary-text-color);
@@ -666,10 +833,56 @@ class K93AnsOverviewCard extends HTMLElement {
           margin: 0 12px;
           opacity: 0.5;
         }
-        @keyframes k93-ticker {
+        @keyframes sentinel-ticker {
           from { transform: translateX(0); }
           to { transform: translateX(-50%); }
         }
+
+        /* MD3 filter chips: 32px, 8px corners, label-large, state layer, check icon when selected. */
+        .filter-bar {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          padding: 0 16px 8px;
+        }
+        .chip {
+          position: relative;
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          height: 32px;
+          padding: 0 16px;
+          box-sizing: border-box;
+          border: 1px solid var(--md-sys-color-outline-variant, var(--outline-color, var(--divider-color)));
+          border-radius: 8px;
+          background: transparent;
+          color: var(--md-sys-color-on-surface-variant, var(--secondary-text-color));
+          font-family: inherit;
+          font-size: 14px;
+          font-weight: 500;
+          line-height: 20px;
+          letter-spacing: 0.1px;
+          cursor: pointer;
+          overflow: hidden;
+        }
+        .chip::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          background: currentColor;
+          opacity: 0;
+          transition: opacity 15ms linear;
+        }
+        .chip:hover::before { opacity: 0.08; }
+        .chip:focus-visible { outline: 2px solid var(--md-sys-color-secondary, var(--primary-color)); outline-offset: 2px; }
+        .chip:focus-visible::before, .chip:active::before { opacity: 0.1; }
+        .chip.selected {
+          padding-left: 8px;
+          border-color: transparent;
+          background: var(--md-sys-color-secondary-container, color-mix(in srgb, var(--primary-color, #0a84ff) 20%, transparent));
+          color: var(--md-sys-color-on-secondary-container, var(--primary-text-color));
+        }
+        .chip-icon { --mdc-icon-size: 18px; width: 18px; height: 18px; }
 
         .scroll-area {
           flex: 1 1 auto;
@@ -890,9 +1103,11 @@ class K93AnsOverviewCard extends HTMLElement {
       show_unacknowledged: true,
       show_history: true,
       show_channel: true,
+      show_labels: true,
       show_importance: true,
       show_clear_history: true,
       show_delete_button: true,
+      show_filter_bar: false,
       image_display_mode: "thumbnail",
       history_channels: [],
       history_channels_mode: "include",
@@ -912,155 +1127,149 @@ class K93AnsOverviewCard extends HTMLElement {
   }
 
   static getConfigElement() {
-    return document.createElement("k93-ans-overview-card-editor");
+    return document.createElement(`${CARD_TAG}-editor`);
   }
 }
 
-class K93AnsOverviewCardEditor extends HTMLElement {
+class SentinelOverviewCardEditor extends HTMLElement {
+  constructor() {
+    super();
+    this._api = new SentinelApi();
+    this._sentinelConfig = null;
+  }
+
   setConfig(config) {
     this._config = config;
     this._updateForm();
   }
 
   set hass(hass) {
+    const first = !this._hass;
     this._hass = hass;
+    this._api.hass = hass;
+    if (first) this._loadConfig();
     this._updateForm();
+  }
+
+  async _loadConfig() {
+    try {
+      this._sentinelConfig = await this._api.config();
+      this._updateForm();
+    } catch (err) {
+      console.error(`${CARD_TAG}-editor: failed to load channels`, err);
+    }
   }
 
   connectedCallback() {
     if (!this._form) {
       this._form = document.createElement("ha-form");
-      this._form.computeLabel = (item) => {
-        if (item.name.startsWith(CHANNEL_IMPORTANCE_PREFIX)) {
-          const channelKey = item.name.slice(CHANNEL_IMPORTANCE_PREFIX.length);
-          const option = this._channelOptions().find((o) => o.value === channelKey);
-          return `${option ? option.label : channelKey}: minimum importance`;
-        }
-        return K93AnsOverviewCardEditor.LABELS[item.name] || item.name;
-      };
+      this._form.computeLabel = (item) => this._label(item.name);
       this._form.addEventListener("value-changed", (ev) => {
         ev.stopPropagation();
         this._config = ev.detail.value;
         this.dispatchEvent(
-          new CustomEvent("config-changed", {
-            detail: { config: this._config },
-            bubbles: true,
-            composed: true,
-          })
+          new CustomEvent("config-changed", { detail: { config: this._config }, bubbles: true, composed: true })
         );
       });
       this.appendChild(this._form);
+
+      const versionEl = document.createElement("div");
+      versionEl.textContent = `Sentinel Overview Card v${CARD_VERSION}`;
+      versionEl.style.cssText = "text-align: right; font-size: 0.75em; opacity: 0.5; padding: 4px 2px 0;";
+      this.appendChild(versionEl);
     }
     this._updateForm();
   }
 
-  _channelOptions() {
-    const hass = this._hass;
-    if (hass) {
-      const cached = this._channelSensorId && hass.states[this._channelSensorId];
-      const channels = cached
-        ? cached.attributes.channels
-        : (() => {
-            for (const stateObj of Object.values(hass.states)) {
-              if (stateObj.entity_id.startsWith("sensor.k93_ans") && Array.isArray(stateObj.attributes?.channels)) {
-                this._channelSensorId = stateObj.entity_id;
-                return stateObj.attributes.channels;
-              }
-            }
-            return null;
-          })();
-      if (Array.isArray(channels)) {
-        return channels.map((c) => ({
-          value: c.key,
-          label: c.enabled === false ? `${c.name} (${c.key}, disabled)` : `${c.name} (${c.key})`,
-        }));
+  _label(name) {
+    for (const [prefix, suffix] of [
+      [CHANNEL_IMPORTANCE_PREFIX, "minimum importance"],
+      [CHANNEL_LABELS_PREFIX, "labels (empty = all)"],
+    ]) {
+      if (name.startsWith(prefix)) {
+        const key = name.slice(prefix.length);
+        const option = channelOptions(this._sentinelConfig).find((o) => o.value === key);
+        return `${option ? option.label : key}: ${suffix}`;
       }
     }
-    return BUILTIN_CHANNEL_KEYS.map((key) => ({ value: key, label: key }));
+    return SentinelOverviewCardEditor.LABELS[name] || name;
   }
 
   _schema() {
-    const importanceOptions = IMPORTANCE_LEVELS.map((value) => ({
-      value,
-      label: STRINGS.en.importance[value],
-    }));
-    const channelSelector = {
-      select: { multiple: true, custom_value: true, options: this._channelOptions() },
-    };
-    const importanceSelector = { select: { options: importanceOptions } };
-    const languageSelector = {
-      select: {
-        options: [
-          { value: "auto", label: "Automatic (match Home Assistant)" },
-          { value: "en", label: "English" },
-          { value: "no", label: "Norsk" },
-        ],
-      },
-    };
-    const imageDisplayModeSelector = {
-      select: {
-        options: [
-          { value: "thumbnail", label: "Thumbnail to the left" },
-          { value: "full", label: "Full-size, under the notification" },
-          { value: "none", label: "Do not display" },
-        ],
-      },
-    };
-    const channelModeSelector = {
-      select: {
-        options: [
-          { value: "include", label: "Show only selected channels" },
-          { value: "exclude", label: "Hide selected channels" },
-        ],
-      },
-    };
+    const importanceOptions = IMPORTANCE_LEVELS.map((value) => ({ value, label: STRINGS.en.importance[value] }));
+    const select = (options, extra = {}) => ({ select: { options, ...extra } });
 
-    const perChannelImportanceSelector = {
-      select: { options: [{ value: "", label: "(use global default)" }, ...importanceOptions] },
-    };
     const selectedChannels = (this._config?.history_channels_mode || "include") !== "exclude"
       ? (this._config?.history_channels || [])
       : [];
-    const perChannelImportanceFields = selectedChannels.map((channelKey) => ({
-      name: `${CHANNEL_IMPORTANCE_PREFIX}${channelKey}`,
-      selector: perChannelImportanceSelector,
-    }));
+    const perChannelFields = selectedChannels.flatMap((key) => {
+      const fields = [
+        {
+          name: `${CHANNEL_IMPORTANCE_PREFIX}${key}`,
+          selector: select([{ value: "", label: "(use global default)" }, ...importanceOptions]),
+        },
+      ];
+      const labels = labelOptions(this._sentinelConfig, key);
+      if (labels.length) {
+        fields.push({
+          name: `${CHANNEL_LABELS_PREFIX}${key}`,
+          selector: select(labels, { multiple: true, custom_value: true }),
+        });
+      }
+      return fields;
+    });
 
     return [
       { name: "title", selector: { text: {} } },
       { name: "title_icon", selector: { icon: {} } },
-      {
-        name: "title_font_size",
-        selector: { number: { min: 0.5, max: 3, step: 0.05, mode: "box" } },
-      },
+      { name: "title_font_size", selector: { number: { min: 0.5, max: 3, step: 0.05, mode: "box" } } },
       {
         name: "title_icon_size",
         selector: { number: { min: 12, max: 64, step: 1, mode: "box", unit_of_measurement: "px" } },
       },
       { name: "title_icon_color", selector: { text: {} } },
       { name: "title_icon_background", selector: { text: {} } },
-      { name: "language", selector: languageSelector },
+      {
+        name: "language",
+        selector: select([
+          { value: "auto", label: "Automatic (match Home Assistant)" },
+          { value: "en", label: "English" },
+          { value: "no", label: "Norsk" },
+        ]),
+      },
       { name: "show_unacknowledged", selector: { boolean: {} } },
       { name: "show_history", selector: { boolean: {} } },
       { name: "show_channel", selector: { boolean: {} } },
+      { name: "show_labels", selector: { boolean: {} } },
       { name: "show_importance", selector: { boolean: {} } },
       { name: "show_clear_history", selector: { boolean: {} } },
       { name: "show_delete_button", selector: { boolean: {} } },
-      { name: "image_display_mode", selector: imageDisplayModeSelector },
-      { name: "history_channels_mode", selector: channelModeSelector },
-      { name: "history_channels", selector: channelSelector },
-      { name: "history_min_importance", selector: importanceSelector },
-      ...perChannelImportanceFields,
+      { name: "show_filter_bar", selector: { boolean: {} } },
+      {
+        name: "image_display_mode",
+        selector: select([
+          { value: "thumbnail", label: "Thumbnail to the left" },
+          { value: "full", label: "Full-size, under the notification" },
+          { value: "none", label: "Do not display" },
+        ]),
+      },
+      {
+        name: "history_channels_mode",
+        selector: select([
+          { value: "include", label: "Show only selected channels" },
+          { value: "exclude", label: "Hide selected channels" },
+        ]),
+      },
+      {
+        name: "history_channels",
+        selector: select(channelOptions(this._sentinelConfig), { multiple: true, custom_value: true }),
+      },
+      { name: "history_min_importance", selector: select(importanceOptions) },
+      ...perChannelFields,
       { name: "show_ticker", selector: { boolean: {} } },
       { name: "ticker_limit", selector: { number: { min: 1, max: 500, mode: "box" } } },
-      {
-        name: "ticker_font_size",
-        selector: { number: { min: 0.5, max: 3, step: 0.05, mode: "box" } },
-      },
-      {
-        name: "ticker_speed",
-        selector: { number: { min: 0.25, max: 4, step: 0.25, mode: "box" } },
-      },
+      { name: "ticker_font_size", selector: { number: { min: 0.5, max: 3, step: 0.05, mode: "box" } } },
+      { name: "ticker_speed", selector: { number: { min: 0.25, max: 4, step: 0.25, mode: "box" } } },
       { name: "max_items", selector: { number: { min: 1, max: 500, mode: "box" } } },
       {
         name: "card_height",
@@ -1093,7 +1302,7 @@ class K93AnsOverviewCardEditor extends HTMLElement {
   }
 }
 
-K93AnsOverviewCardEditor.LABELS = {
+SentinelOverviewCardEditor.LABELS = {
   title: "Title",
   title_icon: "Title icon",
   title_font_size: "Title font size (em)",
@@ -1104,9 +1313,11 @@ K93AnsOverviewCardEditor.LABELS = {
   show_unacknowledged: "Show unacknowledged section",
   show_history: "Show history section",
   show_channel: "Show channel on each notification",
+  show_labels: "Show labels on each notification",
   show_importance: "Show importance on each notification",
   show_clear_history: "Show \"Clear\" button on the History section",
   show_delete_button: "Show delete button on history rows",
+  show_filter_bar: "Show channel/label filter chips above History",
   image_display_mode: "Image display mode",
   history_channels_mode: "Channel filter mode for History + ticker",
   history_channels: "Channels for History + ticker (empty = no filter; suggests configured channels)",
@@ -1124,12 +1335,14 @@ K93AnsOverviewCardEditor.LABELS = {
   tap_action: "Tap action (title/icon row)",
 };
 
-customElements.define("k93-ans-overview-card", K93AnsOverviewCard);
-customElements.define("k93-ans-overview-card-editor", K93AnsOverviewCardEditor);
+defineElement(CARD_TAG, SentinelOverviewCard);
+defineElement(`${CARD_TAG}-editor`, SentinelOverviewCardEditor);
+defineElement(LEGACY_CARD_TAG, class extends SentinelOverviewCard {});
+defineElement(`${LEGACY_CARD_TAG}-editor`, class extends SentinelOverviewCardEditor {});
 
 window.customCards = window.customCards || [];
 window.customCards.push({
-  type: "k93-ans-overview-card",
-  name: "K93 ANS Overview Card",
-  description: "Shows K93 ANS notification history and unacknowledged notifications.",
+  type: CARD_TAG,
+  name: "Sentinel Overview Card",
+  description: "Sentinel notification history and unacknowledged notifications, filterable by channel and label.",
 });
