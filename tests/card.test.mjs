@@ -5,10 +5,11 @@ import { fakeHass, loadCard } from "./harness.mjs";
 const card = loadCard(new URL("../sentinel-overview-card.js", import.meta.url).pathname);
 const matchesFilter = card.evaluate("matchesFilter");
 
-test("registers new and legacy element names", () => {
-  for (const tag of ["sentinel-overview-card", "sentinel-overview-card-editor", "k93-ans-overview-card", "k93-ans-overview-card-editor"]) {
+test("registers only the Sentinel element names", () => {
+  for (const tag of ["sentinel-overview-card", "sentinel-overview-card-editor"]) {
     assert.ok(card.defined.has(tag), tag);
   }
+  assert.ok(!card.defined.has("k93-ans-overview-card"));
   assert.equal(card.context.window.customCards[0].type, "sentinel-overview-card");
 });
 

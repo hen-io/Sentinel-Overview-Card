@@ -1,7 +1,6 @@
 
-const CARD_VERSION = "0.2.0";
+const CARD_VERSION = "0.2.1";
 const CARD_TAG = "sentinel-overview-card";
-const LEGACY_CARD_TAG = "k93-ans-overview-card";
 const IMPORTANCE_LEVELS = ["low", "normal", "high", "critical"];
 
 function fireDomEvent(node, type, detail) {
@@ -1337,8 +1336,6 @@ SentinelOverviewCardEditor.LABELS = {
 
 defineElement(CARD_TAG, SentinelOverviewCard);
 defineElement(`${CARD_TAG}-editor`, SentinelOverviewCardEditor);
-defineElement(LEGACY_CARD_TAG, class extends SentinelOverviewCard {});
-defineElement(`${LEGACY_CARD_TAG}-editor`, class extends SentinelOverviewCardEditor {});
 
 window.customCards = window.customCards || [];
 window.customCards.push({
