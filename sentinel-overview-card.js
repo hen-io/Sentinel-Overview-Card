@@ -1,5 +1,5 @@
 
-const CARD_VERSION = "0.2.1";
+const CARD_VERSION = "0.2.2";
 const CARD_TAG = "sentinel-overview-card";
 const IMPORTANCE_LEVELS = ["low", "normal", "high", "critical"];
 
@@ -247,503 +247,7 @@ function formatRelativeTime(iso, locale, lang) {
   return `${date.toLocaleDateString(locale)} ${time}`;
 }
 
-class SentinelOverviewCard extends HTMLElement {
-  constructor() {
-    super();
-    this.attachShadow({ mode: "open" });
-    this._api = new SentinelApi();
-    this._notifications = [];
-    this._sentinelConfig = null;
-    this._viewFilter = { channel: null, labels: [] };
-    this._subscribed = false;
-    this._unsubscribe = null;
-    this._lightboxSrc = null;
-    this._onReconnect = () => this._fetchList();
-
-    this.shadowRoot.addEventListener("click", (event) => {
-      const target = event.target;
-      const ackButton = target.closest("[data-ack-id]");
-      if (ackButton) {
-        this._acknowledge(ackButton.dataset.ackId);
-        return;
-      }
-      const deleteButton = target.closest("[data-delete-id]");
-      if (deleteButton) {
-        this._delete(deleteButton.dataset.deleteId);
-        return;
-      }
-      if (target.closest("[data-clear-history]")) {
-        this._clearHistory();
-        return;
-      }
-      const channelChip = target.closest("[data-filter-channel]");
-      if (channelChip) {
-        const key = channelChip.dataset.filterChannel || null;
-        this._viewFilter = { channel: this._viewFilter.channel === key ? null : key, labels: [] };
-        this._render();
-        return;
-      }
-      const labelChip = target.closest("[data-filter-label]");
-      if (labelChip) {
-        const key = labelChip.dataset.filterLabel;
-        const labels = this._viewFilter.labels;
-        this._viewFilter = {
-          ...this._viewFilter,
-          labels: labels.includes(key) ? labels.filter((l) => l !== key) : [...labels, key],
-        };
-        this._render();
-        return;
-      }
-      const lightboxTrigger = target.closest("[data-lightbox-src]");
-      if (lightboxTrigger) {
-        this._lightboxSrc = lightboxTrigger.dataset.lightboxSrc;
-        this._render();
-        return;
-      }
-      if (target.closest("[data-lightbox-close]")) {
-        this._lightboxSrc = null;
-        this._render();
-      }
-    });
-  }
-
-  setConfig(config) {
-    this._config = {
-      title: "Notifications",
-      title_icon: null,
-      title_font_size: 1.1,
-      title_icon_size: 24,
-      title_icon_color: null,
-      title_icon_background: null,
-      language: "auto",
-      show_unacknowledged: true,
-      show_history: true,
-      show_channel: true,
-      show_labels: true,
-      show_importance: true,
-      show_clear_history: true,
-      show_delete_button: true,
-      show_filter_bar: false,
-      image_display_mode: "thumbnail",
-      history_channels: [],
-      history_channels_mode: "include",
-      history_min_importance: "low",
-      show_ticker: false,
-      ticker_limit: 10,
-      ticker_font_size: 0.85,
-      ticker_speed: 1,
-      max_items: 50,
-      card_height: null,
-      card_background_color: null,
-      card_border_radius: null,
-      card_border_color: null,
-      card_border_width: null,
-      tap_action: { action: "none" },
-      ...config,
-    };
-    this._render();
-  }
-
-  set hass(hass) {
-    this._hass = hass;
-    this._api.hass = hass;
-    if (!this._subscribed) {
-      this._subscribed = true;
-      hass.connection.addEventListener("ready", this._onReconnect);
-      this._subscribe();
-      this._fetchList();
-      this._render();
-    }
-  }
-
-  _lang() {
-    const configured = this._config?.language;
-    if (configured && configured !== "auto") return configured;
-    const hassLang = this._hass?.language || "";
-    return /^n[bno]/i.test(hassLang) ? "no" : "en";
-  }
-
-  _t(key) {
-    const strings = STRINGS[this._lang()] || STRINGS.en;
-    return strings[key] ?? STRINGS.en[key] ?? key;
-  }
-
-  getCardSize() {
-    const cfg = this._config;
-    if (cfg?.card_height) {
-      return Math.max(1, Math.round(cfg.card_height / 50));
-    }
-    if (!cfg?.show_unacknowledged && !cfg?.show_history) {
-      return cfg?.show_ticker ? 2 : 1;
-    }
-    const base = cfg?.show_ticker ? 3 : 2;
-    return base + Math.min(this._notifications.length, cfg?.max_items ?? 5);
-  }
-
-  getGridOptions() {
-    const cfg = this._config;
-    if (!cfg?.card_height) return undefined;
-    const rows = Math.max(1, Math.round((Number(cfg.card_height) + 8) / 64));
-    return { rows };
-  }
-
-  disconnectedCallback() {
-    this._hass?.connection.removeEventListener("ready", this._onReconnect);
-    if (this._unsubscribe) {
-      this._unsubscribe();
-      this._unsubscribe = null;
-    }
-    this._subscribed = false;
-  }
-
-  _historyFilter() {
-    const cfg = this._config;
-    return {
-      channels: cfg.history_channels,
-      mode: cfg.history_channels_mode,
-      minImportance: cfg.history_min_importance,
-      channelImportance: prefixedConfigMap(cfg, CHANNEL_IMPORTANCE_PREFIX),
-      channelLabels: prefixedConfigMap(cfg, CHANNEL_LABELS_PREFIX),
-    };
-  }
-
-  async _subscribe() {
-    try {
-      this._unsubscribe = await this._api.subscribe("subscribe", (msg) => {
-        if (msg.notification) this._onUpdate(msg.notification);
-        if (msg.deleted_ids) this._onDelete(msg.deleted_ids);
-        if (msg.config) {
-          this._sentinelConfig = msg.config;
-          this._render();
-        }
-      });
-    } catch (err) {
-      console.error(`${CARD_TAG}: failed to subscribe`, err);
-    }
-  }
-
-  async _fetchList() {
-    try {
-      const cfg = this._config || {};
-      const limit = cfg.max_items ?? 50;
-      const results = [await this._api.call("list", { include_acknowledged: true, limit })];
-      const more = [this._api.config()];
-      if (cfg.history_channels && cfg.history_channels.length) {
-        more.push(
-          this._api.call("list", {
-            include_acknowledged: true,
-            limit,
-            channels: cfg.history_channels,
-            channel_mode: cfg.history_channels_mode || "include",
-            min_importance: cfg.history_min_importance || undefined,
-          })
-        );
-      }
-      if (!this._api.legacy) more.push(this._api.call("list", { outstanding_only: true }));
-      const [config, ...lists] = await Promise.all(more);
-      this._sentinelConfig = config;
-      const byId = new Map();
-      for (const result of [...results, ...lists]) {
-        for (const record of result.notifications) byId.set(record.id, record);
-      }
-      this._notifications = [...byId.values()].sort((a, b) => (a.created < b.created ? 1 : -1));
-      this._render();
-    } catch (err) {
-      console.error(`${CARD_TAG}: failed to load notifications`, err);
-    }
-  }
-
-  _onUpdate(record) {
-    const idx = this._notifications.findIndex((n) => n.id === record.id);
-    if (idx >= 0) {
-      this._notifications = [
-        ...this._notifications.slice(0, idx),
-        record,
-        ...this._notifications.slice(idx + 1),
-      ];
-    } else {
-      this._notifications = [record, ...this._notifications];
-    }
-    this._render();
-  }
-
-  _onDelete(deletedIds) {
-    const idSet = new Set(deletedIds);
-    this._notifications = this._notifications.filter((n) => !idSet.has(n.id));
-    this._render();
-  }
-
-  async _acknowledge(notificationId) {
-    try {
-      await this._api.call("acknowledge", { notification_id: notificationId });
-    } catch (err) {
-      console.error(`${CARD_TAG}: failed to acknowledge`, err);
-    }
-  }
-
-  async _delete(notificationId) {
-    try {
-      await this._api.call("delete", { notification_ids: [notificationId] });
-    } catch (err) {
-      console.error(`${CARD_TAG}: failed to delete`, err);
-    }
-  }
-
-  async _clearHistory() {
-    if (!window.confirm(this._t("confirm_clear_history"))) return;
-    try {
-      await this._api.call("clear_history", { include_unacknowledged: false });
-    } catch (err) {
-      console.error(`${CARD_TAG}: failed to clear history`, err);
-    }
-  }
-
-  _channelName(key) {
-    return channelDefs(this._sentinelConfig).find((c) => lower(c.key) === lower(key))?.name || key;
-  }
-
-  _applyViewFilter(records) {
-    const { channel, labels } = this._viewFilter;
-    if (!channel) return records;
-    return records.filter(
-      (r) =>
-        recordChannelKeys(r).includes(channel) &&
-        (!labels.length || labels.some((l) => recordLabelKeys(r).includes(l)))
-    );
-  }
-
-  _chipHtml(attr, value, label, selected) {
-    const check = selected ? `<ha-icon class="chip-icon" icon="mdi:check"></ha-icon>` : "";
-    return (
-      `<button type="button" class="chip${selected ? " selected" : ""}" ${attr}="${esc(value)}" ` +
-      `aria-pressed="${selected}">${check}<span>${esc(label)}</span></button>`
-    );
-  }
-
-  _renderFilterBar(history) {
-    if (!this._config.show_filter_bar || !history.length) return "";
-    const { channel, labels } = this._viewFilter;
-    const presentChannels = [...new Set(history.flatMap(recordChannelKeys))];
-    const channelChips = presentChannels
-      .map((key) => this._chipHtml("data-filter-channel", key, this._channelName(key), channel === key))
-      .join("");
-    let labelChips = "";
-    if (channel) {
-      const configured = labelOptions(this._sentinelConfig, channel).map((o) => lower(o.value));
-      const present = history.filter((r) => recordChannelKeys(r).includes(channel)).flatMap(recordLabelKeys);
-      labelChips = [...new Set([...configured, ...present])]
-        .map((key) => this._chipHtml("data-filter-label", key, labelName(this._sentinelConfig, key), labels.includes(key)))
-        .join("");
-    }
-    return (
-      `<div class="filter-bar" role="toolbar" aria-label="${esc(this._t("filter"))}">${channelChips}</div>` +
-      (labelChips ? `<div class="filter-bar labels">${labelChips}</div>` : "")
-    );
-  }
-
-  _renderItem(record, locale) {
-    const imageMode = this._config.image_display_mode || "thumbnail";
-    const showThumbnail = Boolean(record.image) && imageMode === "thumbnail";
-    const showFullImage = Boolean(record.image) && imageMode === "full";
-
-    const icon = record.icon || "mdi:bell-outline";
-    const color = channelColor(this._sentinelConfig, record);
-    const iconHtml = icon.startsWith("mdi:")
-      ? `<ha-icon icon="${esc(icon)}"${color ? ` style="color: ${esc(color)};"` : ""}></ha-icon>`
-      : `<img class="thumb" src="${esc(icon)}" alt="" />`;
-
-    let leftHtml;
-    if (showThumbnail) {
-      leftHtml = `
-        <img class="row-image" data-lightbox-src="${esc(record.image)}" src="${esc(record.image)}" alt="" loading="lazy" />
-        <span class="icon-badge">${iconHtml}</span>
-      `;
-    } else {
-      leftHtml = iconHtml;
-    }
-
-    const fullImageHtml = showFullImage
-      ? `<img class="row-image-full" data-lightbox-src="${esc(record.image)}" src="${esc(record.image)}" alt="" loading="lazy" />`
-      : "";
-
-    const ackButton = (record.requires_ack && !record.acknowledged)
-      ? `<button class="ack" data-ack-id="${esc(record.id)}">${esc(this._t("acknowledge"))}</button>`
-      : "";
-
-    const deleteButton = (this._config.show_delete_button && (!record.requires_ack || record.acknowledged))
-      ? `<button class="delete" data-delete-id="${esc(record.id)}" title="${esc(this._t("delete"))}" aria-label="${esc(this._t("delete"))}"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>`
-      : "";
-
-    const importanceHtml = this._config.show_importance
-      ? (() => {
-          const label = (STRINGS[this._lang()] || STRINGS.en).importance[record.importance]
-            || record.importance;
-          return `<span class="importance importance-${esc(record.importance)}">${esc(label)}</span>`;
-        })()
-      : "";
-
-    const metaParts = [];
-    if (this._config.show_channel) {
-      const channelLabel = Array.isArray(record.channels) && record.channels.length
-        ? record.channels.join(", ")
-        : record.channel;
-      metaParts.push(esc(channelLabel));
-    }
-    if (this._config.show_labels && recordLabelKeys(record).length) {
-      metaParts.push(esc(recordLabelKeys(record).map((key) => labelName(this._sentinelConfig, key)).join(", ")));
-    }
-    metaParts.push(esc(formatRelativeTime(record.created, locale, this._lang())));
-
-    return `
-      <div class="item">
-        <div class="icon${showThumbnail ? " icon-image" : ""}">${leftHtml}</div>
-        <div class="body">
-          <div class="row1">
-            <span class="title">${esc(record.title)}</span>
-            ${importanceHtml}
-          </div>
-          <div class="message">${esc(record.message)}</div>
-          <div class="meta">${metaParts.join(" &middot; ")}</div>
-          ${fullImageHtml}
-        </div>
-        ${ackButton}${deleteButton}
-      </div>
-    `;
-  }
-
-  _renderLightbox() {
-    if (!this._lightboxSrc) return "";
-    return `
-      <div class="lightbox-overlay" data-lightbox-close>
-        <img class="lightbox-image" src="${esc(this._lightboxSrc)}" alt="" />
-      </div>
-    `;
-  }
-
-  _titleIconHtml() {
-    const cfg = this._config;
-    if (!cfg.title_icon) return "";
-    const size = Number(cfg.title_icon_size) || 24;
-    const color = cfg.title_icon_color || "var(--primary-text-color)";
-    const background = cfg.title_icon_background || "transparent";
-    return `
-      <span class="title-icon" style="width: ${size}px; height: ${size}px; background: ${esc(background)};">
-        <ha-icon icon="${esc(cfg.title_icon)}" style="color: ${esc(color)}; --mdc-icon-size: ${Math.round(size * 0.6)}px;"></ha-icon>
-      </span>
-    `;
-  }
-
-  _tickerItemHtml(record, locale, lang) {
-    const icon = record.icon || "mdi:bell-outline";
-    const color = channelColor(this._sentinelConfig, record);
-    const iconHtml = icon.startsWith("mdi:")
-      ? `<ha-icon class="ticker-icon" icon="${esc(icon)}"${color ? ` style="color: ${esc(color)};"` : ""}></ha-icon>`
-      : `<img class="ticker-icon-img" src="${esc(icon)}" alt="" />`;
-    return (
-      `<span class="ticker-item">${iconHtml}` +
-      `<span class="ticker-text">${esc(formatRelativeTime(record.created, locale, lang))} : ${esc(record.message)}</span></span>`
-    );
-  }
-
-  _renderTicker(locale, lang) {
-    const cfg = this._config;
-    if (!cfg.show_ticker) return "";
-
-    const filter = this._historyFilter();
-    const items = (this._notifications || [])
-      .filter((n) => matchesFilter(n, filter))
-      .slice(0, cfg.ticker_limit ?? 10);
-
-    if (!items.length) return "";
-
-    const sep = `<span class="ticker-sep">&bull;</span>`;
-    const group = items.map((n) => this._tickerItemHtml(n, locale, lang)).join(sep) + sep;
-    const speed = Number(cfg.ticker_speed) || 1;
-    const BASE_LOOP_SECONDS = Math.min(items.length * 5, 120);
-    const duration = Math.max(4, BASE_LOOP_SECONDS / speed);
-    const fontSize = Number(cfg.ticker_font_size) || 0.85;
-
-    const iconHtml = this._titleIconHtml();
-
-    return `
-      <div class="ticker-wrap">
-        ${iconHtml}
-        <div class="ticker-viewport">
-          <div class="ticker-track" style="animation-duration: ${duration}s; font-size: ${fontSize}em;">
-            ${group}${group}
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  _render() {
-    if (!this.shadowRoot || !this._config) return;
-
-    const cfg = this._config;
-    const lang = this._lang();
-    const locale = LOCALE_TAG[lang] || undefined;
-    const all = this._notifications || [];
-    const unacknowledged = all.filter(
-      (n) => n.requires_ack && !n.acknowledged && n.show_in_history !== false
-    );
-    const filter = this._historyFilter();
-    const history = all.filter((n) => matchesFilter(n, filter));
-
-    const sections = [];
-    if (cfg.show_unacknowledged) {
-      sections.push({
-        key: "unacknowledged",
-        label: `${this._t("unacknowledged")}${unacknowledged.length ? ` (${unacknowledged.length})` : ""}`,
-        items: unacknowledged,
-      });
-    }
-    if (cfg.show_history) {
-      sections.push({ key: "history", label: this._t("history"), items: this._applyViewFilter(history) });
-    }
-
-    const body = sections
-      .map((section) => {
-        const clearButton = (section.key === "history" && cfg.show_clear_history && section.items.length)
-          ? `<button class="clear-history" data-clear-history>${esc(this._t("clear_history"))}</button>`
-          : "";
-        return `
-          <div class="section">
-            <div class="section-title-row">
-              <div class="section-title">${esc(section.label)}</div>
-              ${clearButton}
-            </div>
-            ${section.key === "history" ? this._renderFilterBar(history) : ""}
-            ${
-              section.items.length
-                ? section.items.map((item) => this._renderItem(item, locale)).join("")
-                : `<div class="empty">${esc(this._t("nothing"))}</div>`
-            }
-          </div>
-        `;
-      })
-      .join("");
-
-    const tickerHtml = this._renderTicker(locale, lang);
-    const iconInTicker = Boolean(cfg.show_ticker && cfg.title_icon && tickerHtml);
-    const headerIconHtml = iconInTicker ? "" : this._titleIconHtml();
-
-    const cardThemeStyles = [];
-    if (cfg.card_height) cardThemeStyles.push(`height: ${Number(cfg.card_height)}px`);
-    if (cfg.card_background_color) cardThemeStyles.push(`background: ${cfg.card_background_color}`);
-    if (cfg.card_border_radius != null && cfg.card_border_radius !== "") {
-      cardThemeStyles.push(`border-radius: ${Number(cfg.card_border_radius)}px`);
-    }
-    if (cfg.card_border_color || (cfg.card_border_width != null && cfg.card_border_width !== "")) {
-      cardThemeStyles.push(`border-style: solid`);
-      if (cfg.card_border_color) cardThemeStyles.push(`border-color: ${cfg.card_border_color}`);
-      if (cfg.card_border_width != null && cfg.card_border_width !== "") {
-        cardThemeStyles.push(`border-width: ${Number(cfg.card_border_width)}px`);
-      }
-    }
-    if (!this._built) {
-      this.shadowRoot.innerHTML = `
-      <style>
+const OVERVIEW_STYLES = `
         :host { display: block; }
         ha-card {
           display: flex;
@@ -1049,45 +553,705 @@ class SentinelOverviewCard extends HTMLElement {
           background: color-mix(in srgb, var(--error-color, #ff453a) 12%, transparent);
           color: var(--error-color, #ff453a);
         }
-      </style>
-      <ha-card>
-        <div class="ticker-host"></div>
-        <div class="card-header"></div>
-        <div class="scroll-area"></div>
-      </ha-card>
-      <div class="lightbox-host"></div>
-      `;
-      this._built = true;
-      this._cardEl = this.shadowRoot.querySelector("ha-card");
-      this._tickerHostEl = this.shadowRoot.querySelector(".ticker-host");
-      this._headerEl = this.shadowRoot.querySelector(".card-header");
-      this._scrollAreaEl = this.shadowRoot.querySelector(".scroll-area");
-      this._lightboxHostEl = this.shadowRoot.querySelector(".lightbox-host");
-      this._headerEl.addEventListener("click", () => {
-        if (this._config?.tap_action?.action) {
-          handleTapAction(this, this._hass, this._config.tap_action);
-        }
+        [hidden] { display: none !important; }
+        .load-more { height: 1px; }
+`;
+
+class SentinelOverviewCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._api = new SentinelApi();
+    this._notifications = [];
+    this._sentinelConfig = null;
+    this._viewFilter = { channel: null, labels: [] };
+    this._rowCache = new Map();
+    this._configVersion = 0;
+    this._sentinelConfigVersion = 0;
+    this._fetchToken = 0;
+    this._visible = 0;
+    this._historyCount = 0;
+    this._historyCursor = null;
+    this._historyLoaded = 0;
+    this._historyExhausted = false;
+    this._subscribed = false;
+    this._unsubscribe = null;
+    this._lightboxSrc = null;
+    this._onReconnect = () => this._fetchList();
+
+    this.shadowRoot.addEventListener("click", (event) => {
+      const target = event.target;
+      const ackButton = target.closest("[data-ack-id]");
+      if (ackButton) {
+        this._acknowledge(ackButton.dataset.ackId);
+        return;
+      }
+      const deleteButton = target.closest("[data-delete-id]");
+      if (deleteButton) {
+        this._delete(deleteButton.dataset.deleteId);
+        return;
+      }
+      if (target.closest("[data-clear-history]")) {
+        this._clearHistory();
+        return;
+      }
+      const channelChip = target.closest("[data-filter-channel]");
+      if (channelChip) {
+        const key = channelChip.dataset.filterChannel || null;
+        this._viewFilter = { channel: this._viewFilter.channel === key ? null : key, labels: [] };
+        this._visible = this._pageSize();
+        this._render();
+        return;
+      }
+      const labelChip = target.closest("[data-filter-label]");
+      if (labelChip) {
+        const key = labelChip.dataset.filterLabel;
+        const labels = this._viewFilter.labels;
+        this._viewFilter = {
+          ...this._viewFilter,
+          labels: labels.includes(key) ? labels.filter((l) => l !== key) : [...labels, key],
+        };
+        this._visible = this._pageSize();
+        this._render();
+        return;
+      }
+      const lightboxTrigger = target.closest("[data-lightbox-src]");
+      if (lightboxTrigger) {
+        this._lightboxSrc = lightboxTrigger.dataset.lightboxSrc;
+        this._render();
+        return;
+      }
+      if (target.closest("[data-lightbox-close]")) {
+        this._lightboxSrc = null;
+        this._render();
+      }
+    });
+  }
+
+  setConfig(config) {
+    this._config = {
+      title: "Notifications",
+      title_icon: null,
+      title_font_size: 1.1,
+      title_icon_size: 24,
+      title_icon_color: null,
+      title_icon_background: null,
+      language: "auto",
+      show_unacknowledged: true,
+      show_history: true,
+      show_channel: true,
+      show_labels: true,
+      show_importance: true,
+      show_clear_history: true,
+      show_delete_button: true,
+      show_filter_bar: false,
+      image_display_mode: "thumbnail",
+      history_channels: [],
+      history_channels_mode: "include",
+      history_min_importance: "low",
+      show_ticker: false,
+      ticker_limit: 10,
+      ticker_font_size: 0.85,
+      ticker_speed: 1,
+      max_items: 50,
+      page_size: 25,
+      card_height: null,
+      card_background_color: null,
+      card_border_radius: null,
+      card_border_color: null,
+      card_border_width: null,
+      tap_action: { action: "none" },
+      ...config,
+    };
+    this._configVersion += 1;
+    const query = JSON.stringify([this._historyQuery(), this._maxItems(), this._pageSize(), this._config.ticker_limit]);
+    if (this._subscribed && query !== this._lastQuery) this._fetchList();
+    this._lastQuery = query;
+    this._visible = Math.max(this._visible, this._pageSize());
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    this._api.hass = hass;
+    if (!this._subscribed) {
+      this._subscribed = true;
+      hass.connection.addEventListener("ready", this._onReconnect);
+      this._subscribe();
+      this._fetchList();
+      this._render();
+    }
+  }
+
+  _lang() {
+    const configured = this._config?.language;
+    if (configured && configured !== "auto") return configured;
+    const hassLang = this._hass?.language || "";
+    return /^n[bno]/i.test(hassLang) ? "no" : "en";
+  }
+
+  _t(key) {
+    const strings = STRINGS[this._lang()] || STRINGS.en;
+    return strings[key] ?? STRINGS.en[key] ?? key;
+  }
+
+  getCardSize() {
+    const cfg = this._config;
+    if (cfg?.card_height) {
+      return Math.max(1, Math.round(cfg.card_height / 50));
+    }
+    if (!cfg?.show_unacknowledged && !cfg?.show_history) {
+      return cfg?.show_ticker ? 2 : 1;
+    }
+    const base = cfg?.show_ticker ? 3 : 2;
+    return base + Math.min(this._notifications.length, cfg?.max_items ?? 5);
+  }
+
+  getGridOptions() {
+    const cfg = this._config;
+    if (!cfg?.card_height) return undefined;
+    const rows = Math.max(1, Math.round((Number(cfg.card_height) + 8) / 64));
+    return { rows };
+  }
+
+  connectedCallback() {
+    this._dayTimer ??= setInterval(() => {
+      const today = new Date().toDateString();
+      if (today !== this._today) {
+        this._today = today;
+        this._scheduleRender();
+      }
+    }, 60000);
+  }
+
+  disconnectedCallback() {
+    clearInterval(this._dayTimer);
+    this._dayTimer = null;
+    this._hass?.connection.removeEventListener("ready", this._onReconnect);
+    if (this._unsubscribe) {
+      this._unsubscribe();
+      this._unsubscribe = null;
+    }
+    this._subscribed = false;
+  }
+
+  _historyFilter() {
+    const cfg = this._config;
+    return {
+      channels: cfg.history_channels,
+      mode: cfg.history_channels_mode,
+      minImportance: cfg.history_min_importance,
+      channelImportance: prefixedConfigMap(cfg, CHANNEL_IMPORTANCE_PREFIX),
+      channelLabels: prefixedConfigMap(cfg, CHANNEL_LABELS_PREFIX),
+    };
+  }
+
+  async _subscribe() {
+    try {
+      this._unsubscribe = await this._api.subscribe("subscribe", (msg) => {
+        if (msg.notification) this._onUpdate(msg.notification);
+        if (msg.deleted_ids) this._onDelete(msg.deleted_ids);
+        if (msg.config) this._setSentinelConfig(msg.config);
       });
+    } catch (err) {
+      console.error(`${CARD_TAG}: failed to subscribe`, err);
     }
+  }
 
-    if (cardThemeStyles.length) {
-      this._cardEl.setAttribute("style", cardThemeStyles.join("; "));
+  _pageSize() {
+    return Math.max(5, Number(this._config.page_size) || 25);
+  }
+
+  _maxItems() {
+    return Math.max(1, Number(this._config.max_items) || 50);
+  }
+
+  _fetchSize() {
+    return Math.max(this._pageSize() * 2, Number(this._config.ticker_limit) || 10);
+  }
+
+  _historyQuery() {
+    const cfg = this._config;
+    const query = { include_acknowledged: true };
+    if (cfg.history_channels && cfg.history_channels.length) {
+      query.channels = cfg.history_channels;
+      query.channel_mode = cfg.history_channels_mode || "include";
+    }
+    const thresholds = [cfg.history_min_importance || "low", ...Object.values(prefixedConfigMap(cfg, CHANNEL_IMPORTANCE_PREFIX))];
+    const lowest = thresholds.reduce((a, b) => (importanceRank(b) < importanceRank(a) ? b : a));
+    if (lowest !== "low") query.min_importance = lowest;
+    return query;
+  }
+
+  _setSentinelConfig(config) {
+    this._sentinelConfig = config;
+    this._sentinelConfigVersion += 1;
+    this._scheduleRender();
+  }
+
+  _merge(records, replace = false) {
+    const byId = new Map(replace ? [] : this._notifications.map((n) => [n.id, n]));
+    let added = 0;
+    for (const record of records) {
+      if (!byId.has(record.id)) added += 1;
+      byId.set(record.id, record);
+    }
+    this._notifications = [...byId.values()].sort((a, b) => (a.created < b.created ? 1 : a.created > b.created ? -1 : 0));
+    return added;
+  }
+
+  _trackHistoryPage(records, limit) {
+    this._historyLoaded += records.length;
+    if (records.length) this._historyCursor = records[records.length - 1].created;
+    this._historyExhausted = records.length < limit || this._historyLoaded >= this._maxItems();
+  }
+
+  async _fetchList() {
+    const token = ++this._fetchToken;
+    this._historyCursor = null;
+    this._historyLoaded = 0;
+    this._historyExhausted = false;
+    this._visible = this._pageSize();
+    try {
+      const limit = Math.min(this._fetchSize(), this._maxItems());
+      const first = await this._api.call("list", { ...this._historyQuery(), limit });
+      const extra = this._api.legacy
+        ? this._api.call("list", { include_acknowledged: true, limit: this._maxItems() })
+        : this._api.call("list", { outstanding_only: true });
+      const [config, more] = await Promise.all([this._api.config(), extra]);
+      if (token !== this._fetchToken) return;
+      this._trackHistoryPage(first.notifications, limit);
+      if (this._api.legacy) this._historyExhausted = true;
+      this._merge([...first.notifications, ...more.notifications], true);
+      this._setSentinelConfig(config);
+    } catch (err) {
+      console.error(`${CARD_TAG}: failed to load notifications`, err);
+    }
+  }
+
+  async _fetchOlder() {
+    const limit = Math.min(this._fetchSize(), this._maxItems() - this._historyLoaded);
+    if (limit <= 0 || !this._historyCursor) {
+      this._historyExhausted = true;
+      return 0;
+    }
+    const token = this._fetchToken;
+    const result = await this._api.call("list", { ...this._historyQuery(), limit, before: this._historyCursor });
+    if (token !== this._fetchToken) return 0;
+    this._trackHistoryPage(result.notifications, limit);
+    return this._merge(result.notifications);
+  }
+
+  async _loadMore() {
+    if (this._visible < this._historyCount) {
+      this._visible += this._pageSize();
+      this._scheduleRender();
+      return;
+    }
+    if (this._loadingMore || this._historyExhausted) return;
+    this._loadingMore = true;
+    try {
+      if (await this._fetchOlder()) this._visible += this._pageSize();
+    } catch (err) {
+      console.error(`${CARD_TAG}: failed to load older notifications`, err);
+      this._historyExhausted = true;
+    } finally {
+      this._loadingMore = false;
+    }
+    this._scheduleRender();
+  }
+
+  _onUpdate(record) {
+    const idx = this._notifications.findIndex((n) => n.id === record.id);
+    if (idx >= 0) {
+      this._notifications = [
+        ...this._notifications.slice(0, idx),
+        record,
+        ...this._notifications.slice(idx + 1),
+      ];
     } else {
-      this._cardEl.removeAttribute("style");
+      this._notifications = [record, ...this._notifications];
+    }
+    this._scheduleRender();
+  }
+
+  _onDelete(deletedIds) {
+    const idSet = new Set(deletedIds);
+    this._notifications = this._notifications.filter((n) => !idSet.has(n.id));
+    this._scheduleRender();
+  }
+
+  async _acknowledge(notificationId) {
+    try {
+      await this._api.call("acknowledge", { notification_id: notificationId });
+    } catch (err) {
+      console.error(`${CARD_TAG}: failed to acknowledge`, err);
+    }
+  }
+
+  async _delete(notificationId) {
+    try {
+      await this._api.call("delete", { notification_ids: [notificationId] });
+    } catch (err) {
+      console.error(`${CARD_TAG}: failed to delete`, err);
+    }
+  }
+
+  async _clearHistory() {
+    if (!window.confirm(this._t("confirm_clear_history"))) return;
+    try {
+      await this._api.call("clear_history", { include_unacknowledged: false });
+    } catch (err) {
+      console.error(`${CARD_TAG}: failed to clear history`, err);
+    }
+  }
+
+  _channelName(key) {
+    return channelDefs(this._sentinelConfig).find((c) => lower(c.key) === lower(key))?.name || key;
+  }
+
+  _applyViewFilter(records) {
+    const { channel, labels } = this._viewFilter;
+    if (!channel) return records;
+    return records.filter(
+      (r) =>
+        recordChannelKeys(r).includes(channel) &&
+        (!labels.length || labels.some((l) => recordLabelKeys(r).includes(l)))
+    );
+  }
+
+  _chipHtml(attr, value, label, selected) {
+    const check = selected ? `<ha-icon class="chip-icon" icon="mdi:check"></ha-icon>` : "";
+    return (
+      `<button type="button" class="chip${selected ? " selected" : ""}" ${attr}="${esc(value)}" ` +
+      `aria-pressed="${selected}">${check}<span>${esc(label)}</span></button>`
+    );
+  }
+
+  _renderFilterBar(history) {
+    if (!this._config.show_filter_bar || !history.length) return "";
+    const { channel, labels } = this._viewFilter;
+    const presentChannels = [...new Set(history.flatMap(recordChannelKeys))];
+    const channelChips = presentChannels
+      .map((key) => this._chipHtml("data-filter-channel", key, this._channelName(key), channel === key))
+      .join("");
+    let labelChips = "";
+    if (channel) {
+      const configured = labelOptions(this._sentinelConfig, channel).map((o) => lower(o.value));
+      const present = history.filter((r) => recordChannelKeys(r).includes(channel)).flatMap(recordLabelKeys);
+      labelChips = [...new Set([...configured, ...present])]
+        .map((key) => this._chipHtml("data-filter-label", key, labelName(this._sentinelConfig, key), labels.includes(key)))
+        .join("");
+    }
+    return (
+      `<div class="filter-bar" role="toolbar" aria-label="${esc(this._t("filter"))}">${channelChips}</div>` +
+      (labelChips ? `<div class="filter-bar labels">${labelChips}</div>` : "")
+    );
+  }
+
+  _renderItem(record, locale) {
+    const imageMode = this._config.image_display_mode || "thumbnail";
+    const showThumbnail = Boolean(record.image) && imageMode === "thumbnail";
+    const showFullImage = Boolean(record.image) && imageMode === "full";
+
+    const icon = record.icon || "mdi:bell-outline";
+    const color = channelColor(this._sentinelConfig, record);
+    const iconHtml = icon.startsWith("mdi:")
+      ? `<ha-icon icon="${esc(icon)}"${color ? ` style="color: ${esc(color)};"` : ""}></ha-icon>`
+      : `<img class="thumb" src="${esc(icon)}" alt="" />`;
+
+    let leftHtml;
+    if (showThumbnail) {
+      leftHtml = `
+        <img class="row-image" data-lightbox-src="${esc(record.image)}" src="${esc(record.image)}" alt="" loading="lazy" />
+        <span class="icon-badge">${iconHtml}</span>
+      `;
+    } else {
+      leftHtml = iconHtml;
     }
 
+    const fullImageHtml = showFullImage
+      ? `<img class="row-image-full" data-lightbox-src="${esc(record.image)}" src="${esc(record.image)}" alt="" loading="lazy" />`
+      : "";
+
+    const ackButton = (record.requires_ack && !record.acknowledged)
+      ? `<button class="ack" data-ack-id="${esc(record.id)}">${esc(this._t("acknowledge"))}</button>`
+      : "";
+
+    const deleteButton = (this._config.show_delete_button && (!record.requires_ack || record.acknowledged))
+      ? `<button class="delete" data-delete-id="${esc(record.id)}" title="${esc(this._t("delete"))}" aria-label="${esc(this._t("delete"))}"><ha-icon icon="mdi:trash-can-outline"></ha-icon></button>`
+      : "";
+
+    const importanceHtml = this._config.show_importance
+      ? (() => {
+          const label = (STRINGS[this._lang()] || STRINGS.en).importance[record.importance]
+            || record.importance;
+          return `<span class="importance importance-${esc(record.importance)}">${esc(label)}</span>`;
+        })()
+      : "";
+
+    const metaParts = [];
+    if (this._config.show_channel) {
+      const channelLabel = Array.isArray(record.channels) && record.channels.length
+        ? record.channels.join(", ")
+        : record.channel;
+      metaParts.push(esc(channelLabel));
+    }
+    if (this._config.show_labels && recordLabelKeys(record).length) {
+      metaParts.push(esc(recordLabelKeys(record).map((key) => labelName(this._sentinelConfig, key)).join(", ")));
+    }
+    metaParts.push(esc(formatRelativeTime(record.created, locale, this._lang())));
+
+    return `
+      <div class="item">
+        <div class="icon${showThumbnail ? " icon-image" : ""}">${leftHtml}</div>
+        <div class="body">
+          <div class="row1">
+            <span class="title">${esc(record.title)}</span>
+            ${importanceHtml}
+          </div>
+          <div class="message">${esc(record.message)}</div>
+          <div class="meta">${metaParts.join(" &middot; ")}</div>
+          ${fullImageHtml}
+        </div>
+        ${ackButton}${deleteButton}
+      </div>
+    `;
+  }
+
+  _renderLightbox() {
+    if (!this._lightboxSrc) return "";
+    return `
+      <div class="lightbox-overlay" data-lightbox-close>
+        <img class="lightbox-image" src="${esc(this._lightboxSrc)}" alt="" />
+      </div>
+    `;
+  }
+
+  _titleIconHtml() {
+    const cfg = this._config;
+    if (!cfg.title_icon) return "";
+    const size = Number(cfg.title_icon_size) || 24;
+    const color = cfg.title_icon_color || "var(--primary-text-color)";
+    const background = cfg.title_icon_background || "transparent";
+    return `
+      <span class="title-icon" style="width: ${size}px; height: ${size}px; background: ${esc(background)};">
+        <ha-icon icon="${esc(cfg.title_icon)}" style="color: ${esc(color)}; --mdc-icon-size: ${Math.round(size * 0.6)}px;"></ha-icon>
+      </span>
+    `;
+  }
+
+  _tickerItemHtml(record, locale, lang) {
+    const icon = record.icon || "mdi:bell-outline";
+    const color = channelColor(this._sentinelConfig, record);
+    const iconHtml = icon.startsWith("mdi:")
+      ? `<ha-icon class="ticker-icon" icon="${esc(icon)}"${color ? ` style="color: ${esc(color)};"` : ""}></ha-icon>`
+      : `<img class="ticker-icon-img" src="${esc(icon)}" alt="" />`;
+    return (
+      `<span class="ticker-item">${iconHtml}` +
+      `<span class="ticker-text">${esc(formatRelativeTime(record.created, locale, lang))} : ${esc(record.message)}</span></span>`
+    );
+  }
+
+  _renderTicker(locale, lang) {
+    const cfg = this._config;
+    if (!cfg.show_ticker) return "";
+
+    const filter = this._historyFilter();
+    const items = (this._notifications || [])
+      .filter((n) => matchesFilter(n, filter))
+      .slice(0, cfg.ticker_limit ?? 10);
+
+    if (!items.length) return "";
+
+    const sep = `<span class="ticker-sep">&bull;</span>`;
+    const group = items.map((n) => this._tickerItemHtml(n, locale, lang)).join(sep) + sep;
+    const speed = Number(cfg.ticker_speed) || 1;
+    const BASE_LOOP_SECONDS = Math.min(items.length * 5, 120);
+    const duration = Math.max(4, BASE_LOOP_SECONDS / speed);
+    const fontSize = Number(cfg.ticker_font_size) || 0.85;
+
+    const iconHtml = this._titleIconHtml();
+
+    return `
+      <div class="ticker-wrap">
+        ${iconHtml}
+        <div class="ticker-viewport">
+          <div class="ticker-track" style="animation-duration: ${duration}s; font-size: ${fontSize}em;">
+            ${group}${group}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  _scheduleRender() {
+    if (this._renderQueued) return;
+    this._renderQueued = true;
+    requestAnimationFrame(() => {
+      this._renderQueued = false;
+      this._render();
+    });
+  }
+
+  _rowElement(sectionKey, record, locale, epoch, nextCache) {
+    const key = `${sectionKey}:${record.id}`;
+    const signature = `${epoch}|${record.updated_at || ""}|${record.acknowledged}|${record.created}`;
+    let entry = this._rowCache.get(key);
+    if (!entry || entry.signature !== signature) {
+      const template = document.createElement("template");
+      template.innerHTML = this._renderItem(record, locale).trim();
+      entry = { signature, el: template.content.firstElementChild };
+    }
+    nextCache.set(key, entry);
+    return entry.el;
+  }
+
+  _buildSection() {
+    const root = document.createElement("div");
+    root.className = "section";
+    root.innerHTML =
+      `<div class="section-title-row"><div class="section-title"></div><div class="section-action"></div></div>` +
+      `<div class="filter-host"></div><div class="rows"></div><div class="empty"></div><div class="load-more"></div>`;
+    this._scrollAreaEl.appendChild(root);
+    const part = (selector) => root.querySelector(selector);
+    return {
+      root,
+      title: part(".section-title"),
+      action: part(".section-action"),
+      filter: part(".filter-host"),
+      rows: part(".rows"),
+      empty: part(".empty"),
+      more: part(".load-more"),
+    };
+  }
+
+  _setHtml(el, html) {
+    if (el._html !== html) {
+      el._html = html;
+      el.innerHTML = html;
+    }
+  }
+
+  _updateSection(section, { shown, label, actionHtml = "", filterHtml = "", rows, emptyText }) {
+    section.root.hidden = !shown;
+    if (!shown) return;
+    if (section.title.textContent !== label) section.title.textContent = label;
+    this._setHtml(section.action, actionHtml);
+    this._setHtml(section.filter, filterHtml);
+    section.empty.hidden = rows.length > 0;
+    if (!rows.length) section.empty.textContent = emptyText;
+    const current = section.rows.children;
+    if (current.length !== rows.length || rows.some((el, i) => current[i] !== el)) {
+      section.rows.replaceChildren(...rows);
+    }
+  }
+
+  _cardStyle() {
+    const cfg = this._config;
+    const styles = [];
+    if (cfg.card_height) styles.push(`height: ${Number(cfg.card_height)}px`);
+    if (cfg.card_background_color) styles.push(`background: ${cfg.card_background_color}`);
+    if (cfg.card_border_radius != null && cfg.card_border_radius !== "") {
+      styles.push(`border-radius: ${Number(cfg.card_border_radius)}px`);
+    }
+    if (cfg.card_border_color || (cfg.card_border_width != null && cfg.card_border_width !== "")) {
+      styles.push("border-style: solid");
+      if (cfg.card_border_color) styles.push(`border-color: ${cfg.card_border_color}`);
+      if (cfg.card_border_width != null && cfg.card_border_width !== "") {
+        styles.push(`border-width: ${Number(cfg.card_border_width)}px`);
+      }
+    }
+    return styles.join("; ");
+  }
+
+  _render() {
+    if (!this.shadowRoot || !this._config) return;
+    if (!this._built) this._build();
+
+    const cfg = this._config;
+    const lang = this._lang();
+    const locale = LOCALE_TAG[lang] || undefined;
+    const epoch = `${lang}|${new Date().toDateString()}|${this._configVersion}|${this._sentinelConfigVersion}`;
+    const all = this._notifications || [];
+    const unacknowledged = all.filter((n) => n.requires_ack && !n.acknowledged && n.show_in_history !== false);
+    const filter = this._historyFilter();
+    const history = all.filter((n) => matchesFilter(n, filter));
+    const historyItems = this._applyViewFilter(history);
+    this._historyCount = historyItems.length;
+    const lazy = Boolean(this._observer);
+    const shownHistory = lazy ? historyItems.slice(0, this._visible) : historyItems;
+    const nextCache = new Map();
+    const rows = (key, items) => items.map((item) => this._rowElement(key, item, locale, epoch, nextCache));
+
+    const style = this._cardStyle();
+    if (this._cardEl.getAttribute("style") !== style) {
+      if (style) this._cardEl.setAttribute("style", style);
+      else this._cardEl.removeAttribute("style");
+    }
+
+    const tickerHtml = this._renderTicker(locale, lang);
     if (tickerHtml !== this._lastTickerHtml) {
       this._lastTickerHtml = tickerHtml;
       this._tickerHostEl.innerHTML = tickerHtml;
     }
 
-    this._headerEl.setAttribute("style", `font-size: ${Number(cfg.title_font_size) || 1.1}em;`);
-    this._headerEl.innerHTML = `${headerIconHtml}<span>${esc(cfg.title)}</span>`;
-    const hasTapAction = Boolean(cfg.tap_action && cfg.tap_action.action && cfg.tap_action.action !== "none");
-    this._headerEl.classList.toggle("tappable", hasTapAction);
+    const iconInTicker = Boolean(cfg.show_ticker && cfg.title_icon && tickerHtml);
+    this._headerEl.style.fontSize = `${Number(cfg.title_font_size) || 1.1}em`;
+    this._setHtml(this._headerEl, `${iconInTicker ? "" : this._titleIconHtml()}<span>${esc(cfg.title)}</span>`);
+    this._headerEl.classList.toggle("tappable", Boolean(cfg.tap_action?.action && cfg.tap_action.action !== "none"));
 
-    this._scrollAreaEl.innerHTML = body;
-    this._lightboxHostEl.innerHTML = this._renderLightbox();
+    this._scrollAreaEl.hidden = !cfg.show_unacknowledged && !cfg.show_history;
+    this._updateSection(this._sections.unacknowledged, {
+      shown: cfg.show_unacknowledged,
+      label: `${this._t("unacknowledged")}${unacknowledged.length ? ` (${unacknowledged.length})` : ""}`,
+      rows: rows("unacknowledged", unacknowledged),
+      emptyText: this._t("nothing"),
+    });
+    this._updateSection(this._sections.history, {
+      shown: cfg.show_history,
+      label: this._t("history"),
+      actionHtml: cfg.show_clear_history && historyItems.length
+        ? `<button class="clear-history" data-clear-history>${esc(this._t("clear_history"))}</button>`
+        : "",
+      filterHtml: this._renderFilterBar(history),
+      rows: rows("history", shownHistory),
+      emptyText: this._t("nothing"),
+    });
+    this._rowCache = nextCache;
+
+    this._setHtml(this._lightboxHostEl, this._renderLightbox());
+
+    if (lazy && this._moreInView && (shownHistory.length < historyItems.length || !this._historyExhausted)) {
+      setTimeout(() => this._loadMore(), 0);
+    }
+  }
+
+  _build() {
+    this.shadowRoot.innerHTML = `<style>${OVERVIEW_STYLES}</style>
+      <ha-card>
+        <div class="ticker-host"></div>
+        <div class="card-header"></div>
+        <div class="scroll-area"></div>
+      </ha-card>
+      <div class="lightbox-host"></div>`;
+    this._built = true;
+    this._cardEl = this.shadowRoot.querySelector("ha-card");
+    this._tickerHostEl = this.shadowRoot.querySelector(".ticker-host");
+    this._headerEl = this.shadowRoot.querySelector(".card-header");
+    this._scrollAreaEl = this.shadowRoot.querySelector(".scroll-area");
+    this._lightboxHostEl = this.shadowRoot.querySelector(".lightbox-host");
+    this._sections = { unacknowledged: this._buildSection(), history: this._buildSection() };
+    this._headerEl.addEventListener("click", () => {
+      if (this._config?.tap_action?.action) handleTapAction(this, this._hass, this._config.tap_action);
+    });
+    if (typeof IntersectionObserver !== "undefined") {
+      this._observer = new IntersectionObserver((entries) => {
+        this._moreInView = entries.some((entry) => entry.isIntersecting);
+        if (this._moreInView) this._loadMore();
+      });
+      this._observer.observe(this._sections.history.more);
+    }
   }
 
   static getStubConfig() {
@@ -1116,6 +1280,7 @@ class SentinelOverviewCard extends HTMLElement {
       ticker_font_size: 0.85,
       ticker_speed: 1,
       max_items: 50,
+      page_size: 25,
       card_height: null,
       card_background_color: null,
       card_border_radius: null,
@@ -1269,7 +1434,8 @@ class SentinelOverviewCardEditor extends HTMLElement {
       { name: "ticker_limit", selector: { number: { min: 1, max: 500, mode: "box" } } },
       { name: "ticker_font_size", selector: { number: { min: 0.5, max: 3, step: 0.05, mode: "box" } } },
       { name: "ticker_speed", selector: { number: { min: 0.25, max: 4, step: 0.25, mode: "box" } } },
-      { name: "max_items", selector: { number: { min: 1, max: 500, mode: "box" } } },
+      { name: "max_items", selector: { number: { min: 1, max: 2000, mode: "box" } } },
+      { name: "page_size", selector: { number: { min: 5, max: 200, mode: "box" } } },
       {
         name: "card_height",
         selector: { number: { min: 60, max: 2000, step: 10, mode: "box", unit_of_measurement: "px" } },
@@ -1326,6 +1492,7 @@ SentinelOverviewCardEditor.LABELS = {
   ticker_font_size: "Ticker: font size (em)",
   ticker_speed: "Ticker: scroll speed (x)",
   max_items: "Max records fetched (History; ticker uses its own limit above)",
+  page_size: "Rows shown at a time (more load while scrolling)",
   card_height: "Card height (px, blank = auto)",
   card_background_color: "Card background color override (CSS color, blank = theme default)",
   card_border_radius: "Card corner radius override (px, blank = theme default)",
