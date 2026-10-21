@@ -1,5 +1,5 @@
 
-const CARD_VERSION = "0.2.2";
+const CARD_VERSION = "0.2.3";
 const CARD_TAG = "sentinel-overview-card";
 const IMPORTANCE_LEVELS = ["low", "normal", "high", "critical"];
 
@@ -63,6 +63,7 @@ const STRINGS = {
     acknowledge: "Acknowledge",
     delete: "Delete",
     clear_history: "Clear",
+    acknowledge_all: "Acknowledge all",
     filter: "Filter",
     confirm_clear_history: "Clear all history? This can't be undone.",
     today: "Today",
@@ -76,6 +77,7 @@ const STRINGS = {
     acknowledge: "Bekreft",
     delete: "Slett",
     clear_history: "Tøm",
+    acknowledge_all: "Bekreft alle",
     filter: "Filtrer",
     confirm_clear_history: "Tøm all historikk? Dette kan ikke angres.",
     today: "I dag",
@@ -409,17 +411,22 @@ const OVERVIEW_STYLES = `
           letter-spacing: 0.6px;
           color: var(--secondary-text-color);
         }
-        .clear-history {
+        .clear-history, .text-button {
+          height: 32px;
           border: none;
-          border-radius: 8px;
-          padding: 3px 8px;
-          font-size: 0.72em;
-          font-weight: 600;
-          color: var(--secondary-text-color);
+          border-radius: 16px;
+          padding: 0 12px;
+          font: inherit;
+          font-size: 14px;
+          font-weight: 500;
+          letter-spacing: 0.1px;
+          color: var(--md-sys-color-primary, var(--primary-color, #0a84ff));
           background: transparent;
           cursor: pointer;
           transition: background 0.15s ease, color 0.15s ease;
         }
+        .text-button:hover { background: color-mix(in srgb, var(--md-sys-color-primary, var(--primary-color, #0a84ff)) 8%, transparent); }
+        .clear-history { color: var(--md-sys-color-on-surface-variant, var(--secondary-text-color)); }
         .clear-history:hover {
           background: color-mix(in srgb, var(--error-color, #ff453a) 12%, transparent);
           color: var(--error-color, #ff453a);
@@ -522,33 +529,38 @@ const OVERVIEW_STYLES = `
         .meta { color: var(--secondary-text-color); font-size: 0.78em; margin-top: 4px; }
         .ack {
           align-self: center;
+          height: 32px;
           border: none;
-          border-radius: 8px;
-          padding: 6px 12px;
-          font-size: 0.78em;
-          font-weight: 600;
-          color: var(--primary-color, #0a84ff);
+          border-radius: 16px;
+          padding: 0 16px;
+          font: inherit;
+          font-size: 14px;
+          font-weight: 500;
+          letter-spacing: 0.1px;
+          color: var(--md-sys-color-on-secondary-container, var(--primary-text-color));
           cursor: pointer;
-          background: color-mix(in srgb, var(--primary-color, #0a84ff) 12%, transparent);
-          transition: background 0.15s ease;
+          background: var(--md-sys-color-secondary-container, color-mix(in srgb, var(--primary-color, #0a84ff) 18%, transparent));
+          transition: box-shadow 0.15s ease;
           flex-shrink: 0;
         }
-        .ack:hover { background: color-mix(in srgb, var(--primary-color, #0a84ff) 20%, transparent); }
+        .ack:hover { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
         .delete {
           align-self: center;
           display: flex;
           align-items: center;
           justify-content: center;
+          width: 40px;
+          height: 40px;
           border: none;
-          border-radius: 8px;
-          padding: 6px;
-          color: var(--secondary-text-color);
+          border-radius: 50%;
+          padding: 0;
+          color: var(--md-sys-color-on-surface-variant, var(--secondary-text-color));
           background: transparent;
           cursor: pointer;
           transition: background 0.15s ease, color 0.15s ease;
           flex-shrink: 0;
         }
-        .delete ha-icon { --mdc-icon-size: 18px; }
+        .delete ha-icon { --mdc-icon-size: 20px; }
         .delete:hover {
           background: color-mix(in srgb, var(--error-color, #ff453a) 12%, transparent);
           color: var(--error-color, #ff453a);
@@ -581,6 +593,10 @@ class SentinelOverviewCard extends HTMLElement {
 
     this.shadowRoot.addEventListener("click", (event) => {
       const target = event.target;
+      if (target.closest("[data-ack-all]")) {
+        this._acknowledgeAll();
+        return;
+      }
       const ackButton = target.closest("[data-ack-id]");
       if (ackButton) {
         this._acknowledge(ackButton.dataset.ackId);
@@ -887,6 +903,11 @@ class SentinelOverviewCard extends HTMLElement {
     } catch (err) {
       console.error(`${CARD_TAG}: failed to acknowledge`, err);
     }
+  }
+
+  async _acknowledgeAll() {
+    const ids = this._notifications.filter((n) => n.requires_ack && !n.acknowledged).map((n) => n.id);
+    await Promise.all(ids.map((id) => this._acknowledge(id)));
   }
 
   async _delete(notificationId) {
@@ -1205,6 +1226,9 @@ class SentinelOverviewCard extends HTMLElement {
     this._updateSection(this._sections.unacknowledged, {
       shown: cfg.show_unacknowledged,
       label: `${this._t("unacknowledged")}${unacknowledged.length ? ` (${unacknowledged.length})` : ""}`,
+      actionHtml: unacknowledged.length > 1
+        ? `<button class="text-button" data-ack-all>${esc(this._t("acknowledge_all"))}</button>`
+        : "",
       rows: rows("unacknowledged", unacknowledged),
       emptyText: this._t("nothing"),
     });
